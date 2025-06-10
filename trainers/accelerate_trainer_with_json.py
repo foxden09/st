@@ -99,7 +99,11 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
                 
                 # JSON logging
                 if self.json_logger:
-                    perplexity = torch.exp(loss).item() if loss.item() < 10 else float('inf')
+                    try:
+                        perplexity = torch.exp(torch.tensor(loss_value)).item() if loss_value < 10 else float('inf')
+                    except (RuntimeError, ValueError):
+                        perplexity = float('inf')
+                    
                     self.json_logger.log_batch(
                         epoch=epoch,
                         batch=batch_idx,
@@ -117,8 +121,8 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
                 if self.json_logger:
                     self.json_logger.log_validation(
                         epoch=epoch,
-                        loss=val_metrics['loss'],
-                        perplexity=val_metrics['perplexity'],
+                        loss=val_metrics.get('loss'),
+                        perplexity=val_metrics.get('perplexity'),
                         metrics={'batch_idx': batch_idx}
                     )
             
@@ -187,17 +191,20 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
             if self.val_dataloader and (epoch % self.validate_every == 0) and is_main_process:
                 logger.info(f"Running validation for epoch {epoch}...")
                 val_metrics = run_validation(self.model, self.val_dataloader, self.accelerator.device)
-                val_loss = val_metrics['loss']
-                val_perplexity = val_metrics['perplexity']
+                val_loss = val_metrics.get('loss')
+                val_perplexity = val_metrics.get('perplexity')
                 
-                training_metrics['val_losses'].append(val_loss)
-                training_metrics['val_perplexities'].append(val_perplexity)
-                
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    best_path = os.path.join(self.output_dir, "best_model.pt")
-                    self.save_checkpoint_fixed(best_path, epoch=epoch, val_loss=val_loss, is_best=True)
-                    logger.info(f"New best validation loss: {val_loss:.4f}")
+                if val_loss is not None:
+                    training_metrics['val_losses'].append(val_loss)
+                    training_metrics['val_perplexities'].append(val_perplexity)
+                    
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        best_path = os.path.join(self.output_dir, "best_model.pt")
+                        self.save_checkpoint_fixed(best_path, epoch=epoch, val_loss=val_loss, is_best=True)
+                        logger.info(f"New best validation loss: {val_loss:.4f}")
+                else:
+                    logger.warning("Validation returned None loss value")
 
             # Epoch logging
             epoch_metrics = {
