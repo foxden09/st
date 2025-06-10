@@ -582,46 +582,51 @@ def main():
     start_epoch = load_checkpoint_for_resumption(
         args.resume_from_checkpoint, model, optimizer, device, logger
     )
-    
-    # Create trainer with JSON logging
+    # ✅ REPLACE WITH THIS:
+
+    # Create trainer with JSON logging and validation
     logger.info(f"Setting up {args.trainer_type} trainer...")
-    # Create base trainer
-    trainer = get_trainer(
-        trainer_type=args.trainer_type,
-        model=model,
-        dataloader=dataloader,
-        optimizer=optimizer,
-        device=device,
-        num_epochs=config.num_epochs,
-        output_dir=args.output_dir,
-        clip_grad_norm=args.clip_grad_norm,
-        log_interval=args.log_interval
-    )
 
-    # Add JSON logging if enabled
-    if json_logger and args.trainer_type == "accelerate":
-        from trainers.json_trainer import JSONLoggingAccelerateTrainer
-        trainer = JSONLoggingAccelerateTrainer(trainer, json_logger)
-
-    # Add validation if enabled
-    if val_dataloader:
-        from utils.validation_utils import ValidationTrainerWrapper
-        trainer = ValidationTrainerWrapper(
-            trainer=trainer,
-            val_dataloader=val_dataloader,
-            validate_every=args.validate_every,
-            json_logger=json_logger
+    if args.trainer_type == "accelerate":
+        # Use the integrated AccelerateTrainerWithJSON
+        from trainers.accelerate_trainer_with_json import create_accelerate_trainer_with_json_logging
+        
+        trainer = create_accelerate_trainer_with_json_logging(
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            device=device,
+            output_dir=args.output_dir,
+            experiment_name=args.experiment_name,
+            num_epochs=config.num_epochs,
+            log_interval=args.log_interval,
+            json_log_every_n_steps=args.json_log_steps,
+            val_dataloader=val_dataloader,  # Validation built-in
+            validate_every=args.validate_every
         )
-    # Wrap trainer with validation support
-    if val_dataloader is not None:
-        trainer = ValidationTrainerWrapper(
-            trainer=trainer,
-            val_dataloader=val_dataloader,
-            validate_every=args.validate_every,
-            json_logger=json_logger
+        
+        if val_dataloader:
+            logger.info(f"Trainer created with validation support ({len(val_dataloader)} batches)")
+        else:
+            logger.info("Trainer created without validation")
+            
+    else:
+        # Fallback for non-accelerate trainers (no JSON logging or validation)
+        trainer = get_trainer(
+            trainer_type=args.trainer_type,
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            device=device,
+            num_epochs=config.num_epochs,
+            output_dir=args.output_dir,
+            clip_grad_norm=args.clip_grad_norm,
+            log_interval=args.log_interval
         )
-        logger.info("Trainer wrapped with validation support")
-    
+        
+        if json_logger or val_dataloader:
+            logger.warning(f"JSON logging and validation only supported with accelerate trainer, but using {args.trainer_type}")
+        
     # Adjust for resumption if needed
     if start_epoch > 0:
         remaining_epochs = config.num_epochs - start_epoch
