@@ -1,6 +1,6 @@
 """
 Clean wrapper for AccelerateTrainer with JSON logging.
-Fixes the logging issues by properly integrating with the training loop.
+FIXED: Now properly inherits from AccelerateTrainer with correct signature.
 """
 
 import os
@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 class AccelerateTrainerWithJSON(AccelerateTrainer):
     """
     Enhanced AccelerateTrainer with built-in JSON logging and validation.
+    FIXED: Now properly matches parent class signature.
     """
     
     def __init__(self, 
                  model, 
                  dataloader, 
                  optimizer, 
-                 accelerator,
+                 device,  # ✅ FIXED: Use device, not accelerator
                  num_epochs: int = 10,
                  log_interval: int = 10,
                  output_dir: Optional[str] = None,
@@ -40,10 +41,17 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
                  validate_every: int = 1,
                  validate_every_n_batches: int = None):
         
-        super().__init__(model, dataloader, optimizer, accelerator, output_dir, callbacks)
+        # ✅ FIXED: Pass device to parent, which creates accelerator internally
+        super().__init__(
+            model, dataloader, optimizer, device, 
+            num_epochs, output_dir, callbacks
+        )
         
+        # Override num_epochs and log_interval from parent
         self.num_epochs = num_epochs
         self.log_interval = log_interval
+        
+        # JSON logging and validation parameters
         self.json_logger = json_logger
         self.val_dataloader = val_dataloader
         self.validate_every = validate_every
@@ -51,12 +59,75 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
         
         # Global step counter
         self.global_step = 0
-
         self.best_val_loss = float('inf')
+        
+        # ✅ self.accelerator is now available from parent class
     
+    def _train_epoch(self, epoch: int) -> float:
+        """Train one epoch with JSON logging."""
+        self.model.train()
+        total_loss = 0.0
+        num_batches = len(self.dataloader)
+        is_main_process = self.accelerator.is_main_process
+        
+        for batch_idx, batch in enumerate(self.dataloader):
+            self._trigger_callbacks('on_batch_begin', batch_idx, logs={'epoch': epoch})
+            
+            # Forward pass
+            outputs = self.model(**batch)
+            loss = outputs.loss if hasattr(outputs, 'loss') else outputs
+            
+            # Backward pass
+            self.accelerator.backward(loss)
+            
+            # Gradient clipping
+            if self.clip_grad_norm:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            
+            # Optimizer step
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            
+            # Accumulate loss
+            loss_value = loss.item()
+            total_loss += loss_value
+            self.global_step += 1
+            
+            # Logging
+            if batch_idx % self.log_interval == 0 and is_main_process:
+                self.log_batch(batch_idx, loss_value, epoch)
+                
+                # JSON logging
+                if self.json_logger:
+                    perplexity = torch.exp(loss).item() if loss.item() < 10 else float('inf')
+                    self.json_logger.log_batch(
+                        epoch=epoch,
+                        batch=batch_idx,
+                        step=self.global_step,
+                        loss=loss_value,
+                        perplexity=perplexity
+                    )
+            
+            # Mid-epoch validation
+            if (self.val_dataloader and self.validate_every_n_batches and 
+                batch_idx % self.validate_every_n_batches == 0 and 
+                batch_idx > 0 and is_main_process):
+                
+                val_metrics = run_validation(self.model, self.val_dataloader, self.accelerator.device)
+                if self.json_logger:
+                    self.json_logger.log_validation(
+                        epoch=epoch,
+                        loss=val_metrics['loss'],
+                        perplexity=val_metrics['perplexity'],
+                        metrics={'batch_idx': batch_idx}
+                    )
+            
+            self._trigger_callbacks('on_batch_end', batch_idx, logs={'loss': loss_value, 'epoch': epoch})
+        
+        return total_loss / num_batches
+
     def train(self) -> Dict[str, Any]:
         """Training loop with JSON logging and validation."""
-        
         # Only log on main process
         is_main_process = self.accelerator.is_main_process
         
@@ -140,133 +211,68 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
             if is_main_process:
                 self.log_epoch(epoch, epoch_loss, epoch_metrics)
                 
-                # Log epoch end to JSON
+                # JSON epoch logging
                 if self.json_logger:
                     self.json_logger.log_epoch_end(epoch, epoch_metrics)
+                    
+                    # Also log validation if available
+                    if val_loss is not None:
+                        self.json_logger.log_validation(epoch, val_loss, val_perplexity)
             
             self._trigger_callbacks('on_epoch_end', epoch, logs=epoch_metrics)
             
-            # Save checkpoint (only on main process)
+            # Save checkpoint
             if self.output_dir and is_main_process:
                 checkpoint_path = os.path.join(self.output_dir, f"checkpoint_epoch_{epoch}.pt")
-                self.save_checkpoint(checkpoint_path, epoch=epoch, loss=epoch_loss)
+                self.save_checkpoint_fixed(checkpoint_path, epoch=epoch)
         
-        # Final metrics
-        training_metrics['training_time'] = time.time() - total_start_time
+        # Training complete
+        total_time = time.time() - total_start_time
+        training_metrics['training_time'] = total_time
         training_metrics['total_batches'] = self.global_step
         
         if training_metrics['epoch_losses']:
             training_metrics['final_loss'] = training_metrics['epoch_losses'][-1]
         if training_metrics['val_losses']:
             training_metrics['final_val_loss'] = training_metrics['val_losses'][-1]
+            training_metrics['final_val_perplexity'] = training_metrics['val_perplexities'][-1]
         
         if is_main_process:
-            logger.info(f"Training completed in {training_metrics['training_time']:.2f}s")
-            logger.info(f"Final training loss: {training_metrics['final_loss']:.6f}")
-            if training_metrics['final_val_loss'] != float('nan'):
-                logger.info(f"Final validation loss: {training_metrics['final_val_loss']:.6f}")
+            logger.info(f"Training completed in {total_time:.2f} seconds")
+            logger.info(f"Final loss: {training_metrics['final_loss']:.4f}")
+            if training_metrics['val_losses']:
+                logger.info(f"Final validation loss: {training_metrics['final_val_loss']:.4f}")
         
         self._trigger_callbacks('on_train_end', logs=training_metrics)
         
-        training_metrics['best_val_loss'] = getattr(self, 'best_val_loss', float('inf'))
-        
         return training_metrics
-    
-    def _train_epoch(self, epoch: int) -> float:
-        """Train one epoch with proper JSON logging."""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = 0
-        is_main_process = self.accelerator.is_main_process
+
+    def save_checkpoint_fixed(self, path: str, epoch: int, val_loss: float = None, is_best: bool = False):
+        """Save checkpoint with proper unwrapping."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         
-        for batch_idx, batch in enumerate(self.dataloader):
-            self.global_step += 1
-            
-            # Move batch to device (accelerator handles this)
-            input_ids = batch['input_ids']
-            labels = batch.get('labels', input_ids)
-            
-            # Forward pass
-            with self.accelerator.accumulate(self.model):
-                outputs = self.model(input_ids, labels=labels)
-                loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
-                
-                # Backward pass
-                self.accelerator.backward(loss)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            
-            # Track metrics
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            num_batches += 1
-            
-            # Calculate perplexity for this batch
-            batch_perplexity = torch.exp(loss).item()
-            
-            # Batch logging (only on main process, every log_interval batches)
-            if is_main_process and batch_idx % self.log_interval == 0:
-                self.log_batch(batch_idx, batch_loss, epoch, metrics={'perplexity': batch_perplexity})
-            
-            # JSON batch logging (only on main process, every 50 batches)
-            if self.json_logger and is_main_process and batch_idx % 50 == 0:
-                self.json_logger.log_batch(epoch, batch_idx, self.global_step, batch_loss, batch_perplexity)
-            
-            # Run mini-validation every N batches if configured
-            if (self.validate_every_n_batches and 
-                self.val_dataloader and 
-                batch_idx > 0 and 
-                batch_idx % self.validate_every_n_batches == 0 and
-                is_main_process):
-                
-                logger.info(f"Running mini-validation at batch {batch_idx}...")
-                val_metrics = run_validation(self.model, self.val_dataloader, self.accelerator.device, max_batches=10)
-                val_loss = val_metrics['loss']
-                val_perplexity = val_metrics['perplexity']
-                
-                logger.info(f"Mini-validation - Loss: {val_loss:.4f}, Perplexity: {val_perplexity:.2f}")
-                
-                # Log mini-validation to JSON
-                if self.json_logger:
-                    self.json_logger.log_validation(epoch, val_loss, val_perplexity, 
-                                                   metrics={'type': 'mini_validation', 'batch': batch_idx})
-                
-                # Reset model to training mode
-                self.model.train()
-            
-            self._trigger_callbacks('on_batch_end', batch_idx, logs={
-                'loss': batch_loss,
-                'perplexity': batch_perplexity,
-                'epoch': epoch,
-                'global_step': self.global_step
-            })
+        # Get the unwrapped model
+        model_to_save = self.accelerator.unwrap_model(self.model)
         
-        return total_loss / num_batches if num_batches > 0 else 0.0
-    
-    def log_batch(self,
-                  batch_idx: int,
-                  loss: float,
-                  epoch: Optional[int] = None,
-                  metrics: Optional[Dict[str, Any]] = None):
-        """Log information about a training batch with perplexity."""
-        # Build metrics string
-        metrics_parts = []
-        if metrics:
-            for k, v in metrics.items():
-                if isinstance(v, float):
-                    metrics_parts.append(f"{k}: {v:.4f}")
-                else:
-                    metrics_parts.append(f"{k}: {v}")
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'global_step': self.global_step,
+        }
         
-        metrics_str = ", ".join(metrics_parts)
-        epoch_str = f"Epoch {epoch}, " if epoch is not None else ""
-        
-        logger.info(f"{epoch_str}Batch {batch_idx}, Loss: {loss:.4f}" +
-                   (f", {metrics_str}" if metrics_str else ""))
+        if val_loss is not None:
+            checkpoint['val_loss'] = val_loss
+            
+        if is_best:
+            checkpoint['is_best'] = True
+            
+        torch.save(checkpoint, path)
+        logger.info(f"Checkpoint saved: {path}")
 
 
 def create_accelerate_trainer_with_json_logging(
-    model, dataloader, optimizer, accelerator,
+    model, dataloader, optimizer, device,  # ✅ FIXED: Use device parameter
     output_dir: str,
     experiment_name: str = "training",
     num_epochs: int = 10,
@@ -274,7 +280,8 @@ def create_accelerate_trainer_with_json_logging(
     json_log_every_n_steps: int = 50,
     val_dataloader=None,
     validate_every: int = 1,
-    validate_every_n_batches: int = None
+    validate_every_n_batches: int = None,
+    **kwargs  # Handle any extra parameters
 ) -> AccelerateTrainerWithJSON:
     """Create AccelerateTrainer with JSON logging setup."""
     
@@ -289,7 +296,7 @@ def create_accelerate_trainer_with_json_logging(
         model=model,
         dataloader=dataloader,
         optimizer=optimizer,
-        accelerator=accelerator,
+        device=device,  # ✅ FIXED: Pass device
         num_epochs=num_epochs,
         log_interval=log_interval,
         output_dir=output_dir,

@@ -30,7 +30,7 @@ from datasets import load_dataset
 
 # JSON logging imports
 from utils.json_logger import create_json_logger_for_training
-from trainers.json_trainer import create_accelerate_trainer_with_json_logging
+from trainers.accelerate_trainer_with_json import create_accelerate_trainer_with_json_logging
 
 # Validation imports
 from torch.utils.data import DataLoader, random_split
@@ -586,6 +586,9 @@ def main():
     # Create trainer with JSON logging
     logger.info(f"Setting up {args.trainer_type} trainer...")
     if args.trainer_type == "accelerate":
+        #from accelerate import Accelerator
+        #accelerator = Accelerator()
+
         trainer = create_accelerate_trainer_with_json_logging(
             model=model,
             dataloader=dataloader,
@@ -610,17 +613,7 @@ def main():
             clip_grad_norm=args.clip_grad_norm,
             log_interval=args.log_interval
         )
-    
-    # Wrap trainer with validation support
-    if val_dataloader is not None:
-        trainer = ValidationTrainerWrapper(
-            trainer=trainer,
-            val_dataloader=val_dataloader,
-            validate_every=args.validate_every,
-            json_logger=json_logger
-        )
-        logger.info("Trainer wrapped with validation support")
-    
+
     # Adjust for resumption if needed
     if start_epoch > 0:
         remaining_epochs = config.num_epochs - start_epoch
