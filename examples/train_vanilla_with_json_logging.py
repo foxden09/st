@@ -30,8 +30,8 @@ from utils.data_utils import load_and_prepare_data
 from inference.generation import run_generation
 
 # Enhanced JSON logging imports
-from trainers.simple_trainer_with_json import SimpleTrainerWithJSON, create_json_logger_for_training
-from trainers.accelerate_trainer_with_json import create_accelerate_trainer_with_json_logging
+from trainers.simple_trainer_with_json import SimpleTrainerWithJSON
+from trainers.accelerate_trainer_with_json import create_accelerate_trainer_with_json_logging, create_json_logger_for_training
 
 # Suppress output on non-main processes
 if os.environ.get('LOCAL_RANK', '0') != '0': 
