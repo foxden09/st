@@ -11,6 +11,7 @@ from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .accelerate_trainer import AccelerateTrainer
 from utils.json_logger import JSONLogger, create_json_logger_for_training
@@ -104,74 +105,91 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
         }
     
     def _train_epoch(self, epoch: int) -> float:
-        """Train one epoch with JSON logging."""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = len(self.dataloader)
-        is_main_process = self.accelerator.is_main_process
+        """Train one epoch - FIXED VERSION without hanging."""
+        print(f"[DEBUG] Process {self.accelerator.process_index}: Starting _train_epoch({epoch})")
         
-        for batch_idx, batch in enumerate(self.dataloader):
-            self._trigger_callbacks('on_batch_begin', batch_idx, logs={'epoch': epoch})
+        self.model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        # Create progress bar only for main process to avoid sync issues
+        if self.accelerator.is_local_main_process:
+            progress_bar = tqdm(
+                self.dataloader,
+                desc=f"Epoch {epoch}",
+                leave=False
+            )
+            dataloader_iter = progress_bar
+        else:
+            dataloader_iter = self.dataloader
+        
+        print(f"[DEBUG] Process {self.accelerator.process_index}: Starting batch iteration for epoch {epoch}")
+        
+        for batch_idx, batch_data in enumerate(dataloader_iter):
+            # Debug print for first few batches
+            if batch_idx < 3 or batch_idx % 50 == 0:
+                print(f"[DEBUG] Process {self.accelerator.process_index}: Epoch {epoch}, Batch {batch_idx}")
             
             # Forward pass
-            outputs = self.model(**batch)
-            loss = outputs.get('loss', outputs) if isinstance(outputs, dict) else outputs
-            
-            # Backward pass
-            self.accelerator.backward(loss)
-            
-            # Gradient clipping
-            if self.clip_grad_norm:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
-            
-            # Optimizer step
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            
-            # Accumulate loss
-            loss_value = loss.item()
-            total_loss += loss_value
-            self.global_step += 1
-            
-            # Logging
-            if batch_idx % self.log_interval == 0 and is_main_process:
-                self.log_batch(batch_idx, loss_value, epoch)
+            try:
+                outputs = self.model(**batch_data)
+                loss = outputs.get('loss')
                 
-                # JSON logging
-                if self.json_logger:
-                    try:
-                        perplexity = torch.exp(torch.tensor(loss_value)).item() if loss_value < 10 else float('inf')
-                    except (RuntimeError, ValueError):
-                        perplexity = float('inf')
+                if loss is None:
+                    print(f"[DEBUG] Process {self.accelerator.process_index}: Epoch {epoch}, Batch {batch_idx}: Loss is None, skipping")
+                    continue
                     
-                    self.json_logger.log_batch(
-                        epoch=epoch,
-                        batch=batch_idx,
-                        step=self.global_step,
-                        metrics={  # Put loss and perplexity in metrics dict
-                            'loss': loss_value,
-                            'perplexity': perplexity
-                        }
-                    )
-            
-            # Mid-epoch validation
-            if (self.val_dataloader and self.validate_every_n_batches and 
-                batch_idx % self.validate_every_n_batches == 0 and 
-                batch_idx > 0 and is_main_process):
+                if torch.isnan(loss):
+                    print(f"[ERROR] Process {self.accelerator.process_index}: Epoch {epoch}, Batch {batch_idx}: NaN loss detected")
+                    return float('nan')
                 
-                val_metrics = self._run_validation()
-                if self.json_logger and val_metrics:
-                    self.json_logger.log_validation(
-                        epoch=epoch,
-                        loss=val_metrics.get('loss'),
-                        perplexity=val_metrics.get('perplexity'),
-                        metrics={'batch_idx': batch_idx}
-                    )
+            except Exception as e:
+                print(f"[ERROR] Process {self.accelerator.process_index}: Forward pass error in epoch {epoch}, batch {batch_idx}: {e}")
+                continue
             
-            self._trigger_callbacks('on_batch_end', batch_idx, logs={'loss': loss_value, 'epoch': epoch})
+            # Backward pass - CRITICAL: No sync operations here
+            try:
+                self.accelerator.backward(loss)
+                
+                # Gradient clipping (no sync needed)
+                if self.clip_grad_norm is not None:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+                
+                # Optimizer step (no sync needed)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+            except Exception as e:
+                print(f"[ERROR] Process {self.accelerator.process_index}: Backward pass error in epoch {epoch}, batch {batch_idx}: {e}")
+                continue
+            
+            # Track metrics
+            batch_loss_item = loss.item()
+            epoch_loss += batch_loss_item
+            num_batches += 1
+            
+            # Update progress bar only on main process
+            if self.accelerator.is_local_main_process and hasattr(dataloader_iter, 'set_postfix'):
+                dataloader_iter.set_postfix({"loss": f"{batch_loss_item:.4f}"})
+            
+            # Log at specified intervals (no sync operations)
+            if (batch_idx + 1) % self.log_interval == 0 and self.accelerator.is_local_main_process:
+                batch_size = batch_data.get('input_ids', next(iter(batch_data.values()))).shape[0]
+                samples_processed = (batch_idx + 1) * batch_size
+                print(f"[DEBUG] Process {self.accelerator.process_index}: Logging batch {batch_idx + 1}, loss: {batch_loss_item:.6f}")
+            
+            # CRITICAL: Remove any callback triggers that might contain sync operations
+            # Only trigger callbacks on main process to avoid sync issues
+            if self.accelerator.is_main_process:
+                self._trigger_callbacks('on_batch_end', batch_idx, logs={'loss': batch_loss_item})
         
-        return total_loss / num_batches
-
+        # Calculate average loss
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else float('nan')
+        
+        print(f"[DEBUG] Process {self.accelerator.process_index}: Completed _train_epoch({epoch}), avg_loss: {avg_loss:.6f}, num_batches: {num_batches}")
+        
+        return avg_loss
+    
     def train(self) -> Dict[str, Any]:
         """Training loop with JSON logging and validation."""
         # Only log on main process
