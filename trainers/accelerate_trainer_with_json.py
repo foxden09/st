@@ -148,8 +148,10 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
                         epoch=epoch,
                         batch=batch_idx,
                         step=self.global_step,
-                        loss=loss_value,
-                        perplexity=perplexity
+                        metrics={  # Put loss and perplexity in metrics dict
+                            'loss': loss_value,
+                            'perplexity': perplexity
+                        }
                     )
             
             # Mid-epoch validation

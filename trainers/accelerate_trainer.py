@@ -135,10 +135,8 @@ class AccelerateTrainer(BaseTrainer):
                     batch_size = batch_data.get('input_ids', next(iter(batch_data.values()))).shape[0]
                     samples_processed = (batch_idx + 1) * batch_size * self.accelerator.num_processes
                     self.log_batch(
-                        batch_idx + 1, 
-                        batch_loss_item, 
-                        epoch,  # Remove the keyword argument
-                        {       # metrics as positional argument
+                        batch_idx + 1, batch_loss_item, epoch=epoch,
+                        metrics={
                             'samples': samples_processed,
                             'global_batch': global_batch,
                             'num_processes': self.accelerator.num_processes
