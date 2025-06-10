@@ -30,8 +30,6 @@ from datasets import load_dataset
 
 # JSON logging imports
 from utils.json_logger import create_json_logger_for_training
-from trainers.json_trainer import create_accelerate_trainer_with_json_logging
-
 # Validation imports
 from torch.utils.data import DataLoader, random_split
 
@@ -281,12 +279,14 @@ class ValidationTrainerWrapper:
                 
                 logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, Perplexity: {val_metrics['perplexity']:.2f}")
                 
-                # Log to JSON if available
+                # Log validation to JSON if available
                 if self.json_logger:
                     # Check if we're in distributed training
                     is_main_process = True
                     if hasattr(self.trainer, 'accelerator'):
                         is_main_process = self.trainer.accelerator.is_main_process
+                    elif hasattr(self.trainer, 'trainer') and hasattr(self.trainer.trainer, 'accelerator'):
+                        is_main_process = self.trainer.trainer.accelerator.is_main_process
                     
                     if is_main_process:
                         self.json_logger.log_validation(epoch, val_metrics)
@@ -585,32 +585,33 @@ def main():
     
     # Create trainer with JSON logging
     logger.info(f"Setting up {args.trainer_type} trainer...")
-    if args.trainer_type == "accelerate":
-        trainer = create_accelerate_trainer_with_json_logging(
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            device=device,
-            json_logger=json_logger,
-            num_epochs=config.num_epochs,
-            output_dir=args.output_dir,
-            clip_grad_norm=args.clip_grad_norm,
-            log_interval=args.log_interval
+    # Create base trainer
+    trainer = get_trainer(
+        trainer_type=args.trainer_type,
+        model=model,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        device=device,
+        num_epochs=config.num_epochs,
+        output_dir=args.output_dir,
+        clip_grad_norm=args.clip_grad_norm,
+        log_interval=args.log_interval
+    )
+
+    # Add JSON logging if enabled
+    if json_logger and args.trainer_type == "accelerate":
+        from trainers.json_trainer import JSONLoggingAccelerateTrainer
+        trainer = JSONLoggingAccelerateTrainer(trainer, json_logger)
+
+    # Add validation if enabled
+    if val_dataloader:
+        from utils.validation_utils import ValidationTrainerWrapper
+        trainer = ValidationTrainerWrapper(
+            trainer=trainer,
+            val_dataloader=val_dataloader,
+            validate_every=args.validate_every,
+            json_logger=json_logger
         )
-    else:
-        # Simple trainer fallback
-        trainer = get_trainer(
-            trainer_type=args.trainer_type,
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            device=device,
-            num_epochs=config.num_epochs,
-            output_dir=args.output_dir,
-            clip_grad_norm=args.clip_grad_norm,
-            log_interval=args.log_interval
-        )
-    
     # Wrap trainer with validation support
     if val_dataloader is not None:
         trainer = ValidationTrainerWrapper(

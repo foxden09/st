@@ -30,7 +30,6 @@ from datasets import load_dataset
 
 # JSON logging imports
 from utils.json_logger import create_json_logger_for_training
-from trainers.json_trainer import create_accelerate_trainer_with_json_logging
 
 # Validation imports
 from torch.utils.data import DataLoader, random_split
@@ -244,115 +243,6 @@ def load_and_prepare_data_with_validation(dataset_name, dataset_config, tokenize
     logger.info(f"Created val dataloader: {len(val_dataloader)} batches")
     
     return train_dataloader, val_dataloader, tokenizer
-
-
-class ValidationTrainerWrapper:
-    """
-    Wrapper to add validation to existing trainers.
-    """
-    def __init__(self, trainer, val_dataloader=None, validate_every=1, json_logger=None):
-        self.trainer = trainer
-        self.val_dataloader = val_dataloader
-        self.validate_every = validate_every
-        self.json_logger = json_logger
-        
-    def train(self):
-        """Enhanced training with validation."""
-        logger = logging.getLogger(__name__)
-        
-        # Store original methods
-        original_log_epoch = self.trainer.log_epoch
-        original_trigger_callbacks = self.trainer._trigger_callbacks
-        
-        validation_metrics = {
-            'val_losses': [],
-            'val_perplexities': []
-        }
-        
-        def enhanced_log_epoch(epoch: int, avg_loss: float, metrics=None):
-            """Enhanced epoch logging with validation."""
-            # Call original logging
-            original_log_epoch(epoch, avg_loss, metrics)
-            
-            # Run validation if needed
-            if (self.val_dataloader and 
-                epoch % self.validate_every == 0 and 
-                hasattr(self.trainer, 'model') and 
-                hasattr(self.trainer, 'device')):
-                
-                logger.info(f"Running validation for epoch {epoch}...")
-                val_metrics = run_validation(self.trainer.model, self.val_dataloader, self.trainer.device)
-                
-                validation_metrics['val_losses'].append(val_metrics['loss'])
-                validation_metrics['val_perplexities'].append(val_metrics['perplexity'])
-                
-                logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, Perplexity: {val_metrics['perplexity']:.2f}")
-                
-                # Log to JSON if available
-                if self.json_logger:
-                    # Check if we're in distributed training
-                    is_main_process = True
-                    if hasattr(self.trainer, 'accelerator'):
-                        is_main_process = self.trainer.accelerator.is_main_process
-                    
-                    if is_main_process:
-                        self.json_logger.log_validation(epoch, val_metrics)
-                
-                # Update metrics for callbacks
-                if metrics is None:
-                    metrics = {}
-                metrics.update({
-                    'val_loss': val_metrics['loss'],
-                    'val_perplexity': val_metrics['perplexity']
-                })
-        
-        def enhanced_trigger_callbacks(event_name: str, *args, **kwargs):
-            """Enhanced callbacks with validation metrics."""
-            # For epoch_end events, add validation metrics to logs
-            if event_name == 'on_epoch_end' and len(args) >= 2:
-                epoch = args[0]
-                logs = args[1] if len(args) > 1 else kwargs.get('logs', {})
-                
-                # Add latest validation metrics if available
-                if (validation_metrics['val_losses'] and 
-                    epoch % self.validate_every == 0):
-                    val_idx = (epoch // self.validate_every) - 1
-                    if 0 <= val_idx < len(validation_metrics['val_losses']):
-                        if isinstance(logs, dict):
-                            logs.update({
-                                'val_loss': validation_metrics['val_losses'][val_idx],
-                                'val_perplexity': validation_metrics['val_perplexities'][val_idx]
-                            })
-            
-            # Call original callbacks
-            original_trigger_callbacks(event_name, *args, **kwargs)
-        
-        # Replace methods
-        self.trainer.log_epoch = enhanced_log_epoch
-        self.trainer._trigger_callbacks = enhanced_trigger_callbacks
-        
-        try:
-            # Run training
-            result = self.trainer.train()
-            
-            # Add validation metrics to result
-            if isinstance(result, dict):
-                result.update(validation_metrics)
-                if validation_metrics['val_losses']:
-                    result['final_val_loss'] = validation_metrics['val_losses'][-1]
-                    result['final_val_perplexity'] = validation_metrics['val_perplexities'][-1]
-            
-            return result
-            
-        finally:
-            # Restore original methods
-            self.trainer.log_epoch = original_log_epoch
-            self.trainer._trigger_callbacks = original_trigger_callbacks
-    
-    def __getattr__(self, name):
-        """Delegate all other attributes to the wrapped trainer."""
-        return getattr(self.trainer, name)
-
 
 def create_symbolic_config(args):
     """Create configuration for the symbolic transformer."""
@@ -600,32 +490,33 @@ def main():
     
     # Create trainer with JSON logging
     logger.info(f"Setting up {args.trainer_type} trainer...")
-    if args.trainer_type == "accelerate":
-        trainer = create_accelerate_trainer_with_json_logging(
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            device=device,
-            json_logger=json_logger,
-            num_epochs=config.num_epochs,
-            output_dir=args.output_dir,
-            clip_grad_norm=args.clip_grad_norm,
-            log_interval=args.log_interval
+    # Create base trainer
+    trainer = get_trainer(
+        trainer_type=args.trainer_type,
+        model=model,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        device=device,
+        num_epochs=config.num_epochs,
+        output_dir=args.output_dir,
+        clip_grad_norm=args.clip_grad_norm,
+        log_interval=args.log_interval
+    )
+
+    # Add JSON logging if enabled
+    if json_logger and args.trainer_type == "accelerate":
+        from trainers.json_trainer import JSONLoggingAccelerateTrainer
+        trainer = JSONLoggingAccelerateTrainer(trainer, json_logger)
+
+    # Add validation if enabled
+    if val_dataloader:
+        from utils.validation_utils import ValidationTrainerWrapper
+        trainer = ValidationTrainerWrapper(
+            trainer=trainer,
+            val_dataloader=val_dataloader,
+            validate_every=args.validate_every,
+            json_logger=json_logger
         )
-    else:
-        # Simple trainer fallback
-        trainer = get_trainer(
-            trainer_type=args.trainer_type,
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            device=device,
-            num_epochs=config.num_epochs,
-            output_dir=args.output_dir,
-            clip_grad_norm=args.clip_grad_norm,
-            log_interval=args.log_interval
-        )
-    
     # Wrap trainer with validation support (NEW)
     if val_dataloader is not None:
         trainer = ValidationTrainerWrapper(
