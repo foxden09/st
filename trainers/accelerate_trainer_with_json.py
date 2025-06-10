@@ -268,7 +268,10 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
                     
                     # Also log validation if available
                     if val_loss is not None:
-                        self.json_logger.log_validation(epoch, val_loss, val_perplexity)
+                        self.json_logger.log_validation(epoch, {
+                            'loss': val_loss,
+                            'perplexity': val_perplexity
+                        })
             
             self._trigger_callbacks('on_epoch_end', epoch, logs=epoch_metrics)
             
