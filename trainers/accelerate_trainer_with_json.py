@@ -115,7 +115,7 @@ class AccelerateTrainerWithJSON(AccelerateTrainer):
             
             # Forward pass
             outputs = self.model(**batch)
-            loss = outputs.loss if hasattr(outputs, 'loss') else outputs
+            loss = outputs.get('loss', outputs) if isinstance(outputs, dict) else outputs
             
             # Backward pass
             self.accelerator.backward(loss)
