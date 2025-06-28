@@ -138,18 +138,6 @@ symbolic_transformer/
 └── outputs/
 ```
 
-## Research Applications
-
-- **Mechanistic Interpretability**: Study symbolic manipulation and abductive reasoning properties 
-- **Neuro-Symbolic AI**: Bridge neural and symbolic approaches  
-- **Scientific Computing**: Interpretable mathematical reasoning
-
-## Contributing
-
-1. **Issues**: Report bugs or request features
-2. **Pull Requests**: Submit improvements with tests
-3. **Research**: Share experimental results and benchmarks
-
 ## Citation
 
 ```bibtex
